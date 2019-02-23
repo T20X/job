@@ -8,62 +8,11 @@
 
 // Test config
 static const uint64_t INTERVAL = 1000; // delay between produced messages (ns)
-static const uint64_t MESSAGE_COUNT = 500000;   // test size
+static const uint64_t MESSAGE_COUNT = 5000000;   // test size
 static const uint64_t STATS_SAMPLE_SIZE = 100000; // sample size for stats
 static const int MAX_INPUT = 10000;
 
-using Queue = SPSCQueue<std::pair<int,int>, 8/*Q max len*/>;
-
-// Sample Implementation
-template <typename Input, typename Output>
-void stream_processor(Input &rx, Output &tx) {
-
-  std::array<uint64_t, MAX_INPUT> state = {0}; 
-  std::ofstream file("state", std::ios::binary | std::ios::in);
-  {
-      if (!file.is_open())
-      {
-        std::cout << "failed to create a file to persist the state...aborting..." << 
-            std::endl;
-        return;
-      } 
-
-      file.write(reinterpret_cast<const char*>(state.data()), 
-                 state.size() * sizeof(uint64_t));
-      file.flush();
-  }
-
-  Queue q; 
-  std::thread persistor([&state, &q, &tx, &file](){
-
-    uint64_t N = 0;
-    Queue::Buffer items; 
-    while (N < MESSAGE_COUNT)
-    {    
-        size_t batchN = q.drainByCopy(items);
-        N += batchN;
-        
-        for (size_t i = 0; i < batchN; i++)
-        {
-        } 
-
-        for (size_t i = 0; i < batchN; i++)
-            tx(items[i].second, 1);
-    }
-  }); 
-  
-  int tmp;
-  while (rx(&tmp, 1) > 0) {
-    state[tmp] += 1 + state[(tmp + 1) % MAX_INPUT];
-    q.produce([first=tmp, second=state[tmp]](auto&& item){
-      item.first = first;
-      item.second = second;
-    });
-  }
-
-  persistor.join();
-
-}
+using Queue = SPSCQueue<std::pair<uint64_t,uint64_t>, 2/*Q max len*/>;
 
 // High Resolution Clock
 using hrc = std::chrono::time_point<std::chrono::high_resolution_clock>;
@@ -75,18 +24,75 @@ inline auto hrc_elapsed(hrc start) {
       std::chrono::duration_cast<std::chrono::nanoseconds>(hrc_now() - start)
           .count(),
       0L);
+} 
+
+// Sample Implementation
+template <typename Input, typename Output>
+void stream_processor(Input &rx, Output &tx) {
+
+  std::array<uint64_t, MAX_INPUT> state = {0}; 
+  std::ofstream file("state.s", std::ios::binary | std::ios::out);
+  {
+      if (!file.is_open())
+      {
+          std::cout << "failed to create a file to persist the state...aborting..." << std::endl;
+          return;
+      } 
+
+      file.write(
+         reinterpret_cast<const char*>(state.data()), 
+         state.size() * sizeof(uint64_t)); 
+      file << std::flush;
+  }
+
+  Queue q; 
+  std::thread persistor([&state, &q, &tx, &file](){ 
+    uint64_t N = 0;
+    Queue::Buffer items; 
+    while (N < MESSAGE_COUNT)
+    {    
+        size_t batchN = q.drainByCopy(items); 
+
+        auto now = hrc_now();
+        for (size_t i = 0; i < batchN; i++)
+        {
+            file.seekp(items[i].first * sizeof(uint64_t));
+            file.write(reinterpret_cast<const char*>(&items[i].second), 
+                       sizeof(uint64_t));
+        } 
+        std::cout << "elapsed=" << hrc_elapsed(now) << "\n";
+
+        file << std::flush;
+        for (size_t i = 0; i < batchN; i++)
+            tx(items[i].second, 1); 
+
+        N += batchN; 
+    }
+  }); 
+  
+  int pos = {};
+  while (rx(pos, 1) > 0) {
+    state[pos] += 1 + state[(pos + 1) % MAX_INPUT];
+    q.produce([=](auto&& item){
+      item.first = pos;
+      item.second = state[pos];
+    });
+  }
+
+  persistor.join();
+
 }
 
 // Benchmark Framework
 class generator {
   hrc start_;
   uint64_t sent_ = 0;
-  uint64_t value_ = 0xf00533d;
+  uint64_t value_ = 0xf00533dU;
 
 public:
   generator(hrc start) : start_(start) {}
 
-  int operator()(int *buffer, int count) {
+  int operator()(int& out, int count) {
     if (sent_ == MESSAGE_COUNT) {
       return 0; // eof
     }
@@ -95,11 +101,10 @@ public:
       int avail = (hrc_elapsed(start_) / INTERVAL) + 1 - sent_;
       num_rx = std::min(avail, count);
     } while (num_rx <= 0);
+
     // fill data
-    for (int i = 0; i < num_rx; ++i) {
-      value_ += (++sent_) + 1;
-      buffer[i] = abs(value_) % MAX_INPUT;
-    }
+    value_ += (++sent_) + 1;
+    out = abs(value_) % MAX_INPUT;
     return num_rx;
   }
 };
@@ -122,14 +127,14 @@ public:
 
     stats_count_ += count;
     avg_latency = avg_latency  * 
-	         ((stats_count_ - count)/ stats_count_) + 
-		      latency / stats_count_; 
+             ((stats_count_ - count)/ stats_count_) + 
+              latency / stats_count_; 
 
     if (stats_count_ >= STATS_SAMPLE_SIZE) {
       auto throughput =
           (stats_count_ * 1'000'000'000) / (hrc_elapsed(stats_start_));
 
-      std::cout << stats_count_ << " messages: avg latency: " << avg_latency
+      std::cout << stats_count_ << " messages: avg latency: " << (uint64_t)avg_latency
                 << "ns; throughput: " << throughput << " msgs/sec;"
                 << " last ack size: " << count << "\n";
       // reset
@@ -137,7 +142,7 @@ public:
       avg_latency = 0;
       stats_count_ = 0;
     }
-	
+    
     count_ += count;
   }
 };
