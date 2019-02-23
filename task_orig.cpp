@@ -2,24 +2,67 @@
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <thread>
+#include <fstream>
+#include "SPSCQueue.h"
 
 // Test config
 static const uint64_t INTERVAL = 1000; // delay between produced messages (ns)
-static const uint64_t MESSAGE_COUNT = 50000000;   // test size
+static const uint64_t MESSAGE_COUNT = 500000;   // test size
 static const uint64_t STATS_SAMPLE_SIZE = 100000; // sample size for stats
 static const int MAX_INPUT = 10000;
+
+using Queue = SPSCQueue<std::pair<int,int>, 8/*Q max len*/>;
 
 // Sample Implementation
 template <typename Input, typename Output>
 void stream_processor(Input &rx, Output &tx) {
-  // This is the state we'd like to persist
-  std::array<int, MAX_INPUT> state = {0};
-  int tmp;
 
+  std::array<uint64_t, MAX_INPUT> state = {0}; 
+  std::ofstream file("state", std::ios::binary | std::ios::in);
+  {
+      if (!file.is_open())
+      {
+        std::cout << "failed to create a file to persist the state...aborting..." << 
+            std::endl;
+        return;
+      } 
+
+      file.write(reinterpret_cast<const char*>(state.data()), 
+                 state.size() * sizeof(uint64_t));
+      file.flush();
+  }
+
+  Queue q; 
+  std::thread persistor([&state, &q, &tx, &file](){
+
+    uint64_t N = 0;
+    Queue::Buffer items; 
+    while (N < MESSAGE_COUNT)
+    {    
+        size_t batchN = q.drainByCopy(items);
+        N += batchN;
+        
+        for (size_t i = 0; i < batchN; i++)
+        {
+        } 
+
+        for (size_t i = 0; i < batchN; i++)
+            tx(items[i].second, 1);
+    }
+  }); 
+  
+  int tmp;
   while (rx(&tmp, 1) > 0) {
     state[tmp] += 1 + state[(tmp + 1) % MAX_INPUT];
-    tx(&state[tmp], 1);
+    q.produce([first=tmp, second=state[tmp]](auto&& item){
+      item.first = first;
+      item.second = second;
+    });
   }
+
+  persistor.join();
+
 }
 
 // High Resolution Clock
@@ -72,7 +115,7 @@ class sink {
 public:
   sink(hrc start) : start_(start), stats_start_(start) {}
 
-  void operator()(const int * /*send_buffer*/, int count) {
+  void operator()(int, int count) {
 
     double latency =
         hrc_elapsed(start_ + std::chrono::nanoseconds(INTERVAL) * count_);
@@ -80,9 +123,9 @@ public:
     stats_count_ += count;
     avg_latency = avg_latency  * 
 	         ((stats_count_ - count)/ stats_count_) + 
-		 latency / stats_count_; 
+		      latency / stats_count_; 
 
-      uint64_t avg_latency = avg_latency;
+    if (stats_count_ >= STATS_SAMPLE_SIZE) {
       auto throughput =
           (stats_count_ * 1'000'000'000) / (hrc_elapsed(stats_start_));
 
